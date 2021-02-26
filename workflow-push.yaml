@@ -1,0 +1,208 @@
+name: Microservice docker image build.
+
+on:
+  push:
+    branches:
+      - "*"
+
+env:
+  PROJECT_ID: project-id
+  GKE_CLUSTER: tg    # TODO: update to cluster name
+  GKE_ZONE: europe-west1-b  # TODO: update to cluster zone
+  ENABLE_CODE_LINT: true
+  ENABLE_CODE_SCANS: false
+
+jobs:
+  prepare:
+    name: Preparing build context
+    runs-on: ubuntu-latest
+    outputs:
+      SANITISED_REPOSITORY_NAME: ${{ steps.get_env.outputs.SANITISED_REPOSITORY_NAME }}
+      DOCKER_IMAGE: ${{ steps.get_env.outputs.DOCKER_IMAGE }}
+      GITHUB_COMMIT_NUMBER: ${{ steps.get_env.outputs.GITHUB_COMMIT_NUMBER }}
+      GITHUB_SHA: ${{ steps.get_env.outputs.GITHUB_SHA }}
+      GITHUB_RUN_ID: ${{ steps.get_env.outputs.GITHUB_RUN_ID }}
+      RELEASE_VERSION: ${{ steps.get_env.outputs.RELEASE_VERSION }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: '0'
+      - name: Setting environment variables
+        id: get_env
+        run: |
+          TMP_SANITISED_REPOSITORY_NAME=$(echo ${{ github.event.repository.name }} | sed -e 's|\.|-|g')
+          TMP_GITHUB_COMMITS_COUNT=$(git rev-list --count HEAD)
+          TMP_GITHUB_COUNT_NUMBER=$(echo ${GITHUB_RUN_NUMBER})
+          echo "::set-output name=SANITISED_REPOSITORY_NAME::$TMP_SANITISED_REPOSITORY_NAME"
+          echo "::set-output name=DOCKER_IMAGE::ghcr.io/${{ github.repository_owner }}/$TMP_SANITISED_REPOSITORY_NAME"
+          echo "::set-output name=GITHUB_COMMIT_NUMBER::$TMP_GITHUB_COMMITS_COUNT"
+          echo "::set-output name=GITHUB_SHA::$(echo ${GITHUB_SHA::8})"
+          echo "::set-output name=GITHUB_RUN_ID::$TMP_GITHUB_COUNT_NUMBER"
+          echo "::set-output name=RELEASE_VERSION::1.$TMP_GITHUB_COMMITS_COUNT.$TMP_GITHUB_COUNT_NUMBER"
+
+  test:
+    needs: [ prepare ]
+    name: Code checks pipeline
+    runs-on: ubuntu-20.04
+    container: github/super-linter:v3
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v2
+      - name: Configure git for private modules
+        run: |
+          git config --global url."https://${{ secrets.GHCR_TOKEN }}:x-oauth-basic@github.com/${{ github.repository_owner }}".insteadOf "https://github.com/${{ github.repository_owner }}"
+          make update
+      - name: Lint Code Base
+        if: env.ENABLE_CODE_LINT == true
+        env:
+          VALIDATE_ALL_CODEBASE: true
+          VALIDATE_DOCKERFILE: false # this leaves us with hadolint only
+          VALIDATE_GO: false # disable bulk validation of go files, run the linter manually
+          DEFAULT_BRANCH: main
+          GITHUB_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          LOG_LEVEL: WARN
+        run: |
+          golangci-lint run --exclude-use-default ./...
+          /action/lib/linter.sh
+      - name: Run unit tests
+        run: |
+          make test
+  code_scans:
+    needs: [ prepare ]
+    name: Code scans pipeline
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v2
+      - name: Configure git for private modules
+        run: |
+          git config --global url."https://${{ secrets.GHCR_TOKEN }}:x-oauth-basic@github.com/${{ github.repository_owner }}".insteadOf "https://github.com/${{ github.repository_owner }}"
+          make update
+      - name: WriteGoList
+        run: go list -json -m all > go.list
+      - name: Running nancy
+        if: env.ENABLE_CODE_SCANS == true
+        uses: sonatype-nexus-community/nancy-github-action@main
+      - name: Running gosec
+        if: env.ENABLE_CODE_SCANS == true
+        uses: securego/gosec@master
+        with:
+          args: ./...
+
+  build:
+    needs: [ prepare, test, code_scans ]
+    name: Docker image build (multiarch)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v2
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.ACTOR }}
+          password: ${{ secrets.GHCR_TOKEN }}
+      - name: Prepare for push
+        id: prep
+        run: |
+          TAGS="${{ needs.prepare.outputs.DOCKER_IMAGE  }}:${{ needs.prepare.outputs.GITHUB_SHA }},${{ needs.prepare.outputs.DOCKER_IMAGE  }}:${{ needs.prepare.outputs.RELEASE_VERSION }},${{ needs.prepare.outputs.DOCKER_IMAGE  }}:latest"
+          echo ::set-output name=tags::${TAGS}
+          BRANCH=$(echo ${GITHUB_REF##*/} | tr '[A-Z]' '[a-z]')
+          LABELS="org.opencontainers.image.revision=${{ needs.prepare.outputs.GITHUB_SHA }}"
+          LABELS="$LABELS,org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          LABELS="$LABELS,org.opencontainers.image.version=$VERSION"
+          LABELS="$LABELS,com.github.repo.branch=$BRANCH"
+          LABELS="$LABELS,com.github.repo.dockerfile=Dockerfile"
+          echo ::set-output name=labels::${LABELS}
+          BUILD_ARGS="BRANCH=$BRANCH"
+          echo ::set-output name=args::${BUILD_ARGS}
+      - name: Build image
+        id: docker_build
+        uses: docker/build-push-action@v2
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          platforms: linux/arm64,linux/amd64
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.prep.outputs.tags }}
+          build-args: |
+            GITHUB_AUTH_TOKEN=${{ secrets.GHCR_TOKEN }}
+            MICROSERVICE_NAME=${{ github.event.repository.name }}
+            GITHUB_COMMIT_NUMBER=${{ needs.prepare.outputs.GITHUB_COMMIT_NUMBER }}
+            GITHUB_SHA=${{ needs.prepare.outputs.GITHUB_SHA }}
+            ${{ steps.prep.outputs.args }}
+          labels: ${{ steps.prep.outputs.labels }}
+          no-cache: true
+      - name: Scan image
+        uses: anchore/scan-action@v2
+        with:
+          image: "${{ needs.prepare.outputs.DOCKER_IMAGE }}:${{ needs.prepare.outputs.GITHUB_SHA }}"
+          fail-build: true
+
+  deploy:
+    name: Docker image deploy (GKE)
+    runs-on: ubuntu-latest
+    needs: [ prepare, build ]
+    if: ${{ github.ref == 'refs/heads/main' }}
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v2
+      with:
+        ref: 'main'
+        fetch-depth: '0'
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@master
+      with:
+        project_id: ${{ env.PROJECT_ID }}
+        service_account_key: ${{ secrets.GKE_ACCES_KEY }}
+        export_default_credentials: true
+    - name: Setup authentication
+      run: |-
+        gcloud --quiet auth configure-docker
+    - uses: google-github-actions/get-gke-credentials@main
+      with:
+        cluster_name: ${{ env.GKE_CLUSTER }}
+        location: ${{ env.GKE_ZONE }}
+        credentials: ${{ secrets.GKE_ACCESS_KEY }}
+    - name: Set up Kustomize
+      run: |-
+        curl -sfLo kustomize_v4.0.1_linux_amd64.tar.gz https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv4.0.1/kustomize_v4.0.1_linux_amd64.tar.gz
+        tar -zxf kustomize_v4.0.1_linux_amd64.tar.gz
+        chmod u+x ./kustomize
+        curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+        chmod u+x ./kubectl
+    - name: Deploy
+      run: |-
+        NEW_IMAGE_NAME="${{ needs.prepare.outputs.DOCKER_IMAGE }}:${{ needs.prepare.outputs.GITHUB_SHA }}"
+        sed -i -e "s|deploymentNameToChange|${{ needs.prepare.outputs.SANITISED_REPOSITORY_NAME }}|g" kubernetes.yaml
+        sed -i -e "s|containerNameToChange|cnt-${{ needs.prepare.outputs.SANITISED_REPOSITORY_NAME }}|g" kubernetes.yaml
+        ./kustomize edit set image imagePlaceholder=$NEW_IMAGE_NAME
+        ./kustomize edit set label name:${{ needs.prepare.outputs.SANITISED_REPOSITORY_NAME }} app:${{ needs.prepare.outputs.SANITISED_REPOSITORY_NAME }}
+        ./kustomize build . | ./kubectl apply -f -
+
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [ prepare, deploy ]
+    if: ${{ github.ref == 'refs/heads/main' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.event.repository.name }}/${{ needs.prepare.outputs.RELEASE_VERSION }}
+          release_name: v${{ needs.prepare.outputs.RELEASE_VERSION }}
+          body: |
+            Released automatically after merge to main.
+          draft: false
+          prerelease: false
