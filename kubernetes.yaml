@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deploymentNameToChange
+  labels:
+    app: tg6-images-processing
+    type: microservice
+  namespace: tg6
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: tg6-images-processing
+      type: microservice
+  template:
+    metadata:
+      labels:
+        app: tg6-images-processing
+        type: microservice
+    spec:
+      volumes:
+        - name: cloudsql-json
+          secret:
+            secretName: cloudsql-json
+      nodeSelector:
+        pooltype: temporary
+      imagePullSecrets:
+      - name: docker-ghcr
+      containers:
+      - name: containerNameToChange
+        image: imagePlaceholder
+        volumeMounts:
+          - name: cloudsql-json
+            mountPath: /secrets/cloudsql-json
+            readOnly: true
+        resources:
+          requests:
+            memory: "24Mi"
+          limits:
+            memory: "48Mi"
+        env:
+          - name: ENVIRONMENT
+            value: production
+          - name: GOOGLE_APPLICATION_CREDENTIALS
+            value: /secrets/cloudsql-json/gcloud.json
+          - name: DB_USER
+            valueFrom:
+              secretKeyRef:
+                name: cloudsql-db-credentials
+                key: username
+          - name: DB_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: cloudsql-db-credentials
+                key: password
+          - name: RMQ_USER
+            value: user
+          - name: RMQ_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: rabbitmq
+                key: rabbitmq-password
+    # define a liveness probe that checks every 5 seconds, starting after 5 seconds
+        # livenessProbe:
+        #   httpGet:
+        #     path: /live
+        #     port: 8090
+        #   initialDelaySeconds: 10
+        #   periodSeconds: 5
+        #   timeoutSeconds: 5
+
+        # # define a readiness probe that checks every 5 seconds
+        # readinessProbe:
+        #   httpGet:
+        #     path: /ready
+        #     port: 8090
+        #   periodSeconds: 5
